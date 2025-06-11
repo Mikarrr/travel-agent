@@ -1,4 +1,7 @@
 from travel_agent import TravelAgentFactory
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 
 def main():
     try:

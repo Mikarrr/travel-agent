@@ -1,6 +1,7 @@
 from langchain_anthropic import ChatAnthropic
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
+from langchain.memory import ConversationBufferMemory
 from datetime import datetime, timedelta
 
 from models import FlightQuery, HotelQuery
@@ -23,49 +24,111 @@ class TravelAgent:
         # Parsery
         self.flight_parser = PydanticOutputParser(pydantic_object=FlightQuery)
         self.hotel_parser = PydanticOutputParser(pydantic_object=HotelQuery)
+        
+        # Memory - przechowuje historię rozmowy
+        self.memory = ConversationBufferMemory(
+            memory_key="chat_history",
+            return_messages=True,
+            input_key="query",
+            output_key="response"
+        )
     
     def process_query(self, user_input: str) -> str:
         """Główna metoda przetwarzająca zapytania użytkownika"""
         try:
-            # KROK 1: LLM rozpoznaje typ i parsuje parametry
+            # Pobierz historię rozmowy
+            chat_history = self.memory.chat_memory.messages
+            history_text = self._format_chat_history(chat_history)
+
+             # DODAJ: Stwórz pełny kontekst z current query
+            full_context = history_text
+            if history_text and history_text != "Brak poprzednich rozmów.":
+                full_context += f"\nUżytkownik (AKTUALNE): {user_input}"
+            else:
+                full_context = f"Użytkownik: {user_input}"
+            
+            # KROK 1: LLM rozpoznaje typ i parsuje parametry z kontekstem
             analysis_prompt = ChatPromptTemplate.from_template("""
-            Przeanalizuj zapytanie użytkownika i określ czy dotyczy LOTÓW czy HOTELI.
-            
-            ZAPYTANIE: "{query}"
-            DZISIEJSZA DATA: {today}
-            
-            WSKAZÓWKI ROZPOZNAWANIA:
-            - LOTY: "lot", "lecieć", "samolot", "airline", "lotnisko", "lot do", "bilety lotnicze"
-            - HOTELE: "hotel", "nocleg", "zakwaterowanie", "rezerwacja hotelu", "gdzie spać", "pobyt"
-            
-            Odpowiedz TYLKO jednym słowem: "FLIGHT" lub "HOTEL"
-            """)
+                Przeanalizuj zapytanie użytkownika i określ czy dotyczy LOTÓW czy HOTELI czy ATRAKCJI.
+                Uwzględnij kontekst poprzednich rozmów. 
+
+                HISTORIA ROZMOWY:
+                {full_context}
+
+                DZISIEJSZA DATA: {today}
+
+                WSKAZÓWKI ROZPOZNAWANIA:
+                - LOTY: "lot", "lecieć", "samolot", "airline", "lotnisko", "lot do", "bilety lotnicze"
+                - HOTELE: "hotel", "nocleg", "zakwaterowanie", "rezerwacja hotelu", "gdzie spać", "pobyt"
+                - ATRAKCJE: "atrakcje", "co robić", "zwiedzanie", "wycieczki", "co zobaczyć"
+                - KONTEKST: Jeśli wcześniej rozmawialiśmy o konkretnym miejscu/dacie, użyj tych informacji
+
+                ZAAWANSOWANE WSKAZÓWKI KONTEKSTOWE:
+                - Jeśli zapytanie to "Tak", "Nie", "OK" lub podobna krótka odpowiedź, sprawdź ostatnie pytanie Agenta:
+                - Jeśli Agent pytał o loty lub propozycja dotyczyła lotów, uznaj to za LOTY
+                - Jeśli Agent pytał o hotele lub propozycja dotyczyła hoteli, uznaj to za HOTELE
+                - Jeśli Agent pytał o atrakcje lub propozycja dotyczyła atrakcji, uznaj to za ATRAKCJE
+
+                LOGIKA PRIORYTETÓW:
+                1. Jeśli zapytanie to krótka odpowiedź (1-3 słowa), zastosuj ZAAWANSOWANE WSKAZÓWKI KONTEKSTOWE
+                2. Jeśli zapytanie zawiera słowa kluczowe LOTY, uznaj to za LOT
+                3. Jeśli zapytanie zawiera słowa kluczowe HOTELE, uznaj to za HOTEL
+                4. Jeśli zapytanie zawiera słowa kluczowe ATRAKCJE, uznaj to za ATRAKCJE
+                5. Jeśli zapytanie nie jest jasne, sprawdź ostatnie pytanie Agenta w historii
+
+                Odpowiedz TYLKO jednym słowem: "LOTY" lub "HOTELE" lub "ATRAKCJE".
+                """)
             
             analysis_chain = analysis_prompt | self.llm
             query_type = analysis_chain.invoke({
-                "query": user_input,
-                "today": datetime.now().strftime('%Y-%m-%d')
+                "today": datetime.now().strftime('%Y-%m-%d'),
+                "full_context": full_context,
             }).content.strip().upper()
             
             print(f"DEBUG: Detected type: {query_type}")
+     
+
+            # Przetwórz zapytanie
+            if query_type == "HOTELE":
+                result = self._handle_hotel_request(user_input, history_text)
+            elif query_type == "LOTY":
+                result = self._handle_flight_request(user_input, history_text)
+            else: 
+                result = self._handle_attractions_request(user_input, history_text)
             
-            if query_type == "HOTEL":
-                return self._handle_hotel_request(user_input)
-            else:  # Default to FLIGHT
-                return self._handle_flight_request(user_input)
+            # Zapisz interakcję do memory
+            self.memory.save_context(
+                {"query": user_input},
+                {"response": result}
+            )
+            print(full_context)
+            return result
+            
                 
         except Exception as e:
             print(f"Error processing query: {e}")
-            return f"❌ Błąd podczas przetwarzania: {str(e)}"
+            error_msg = f"❌ Błąd podczas przetwarzania: {str(e)}"
+            
+            # Zapisz błąd do memory
+            self.memory.save_context(
+                {"query": user_input},
+                {"response": error_msg}
+            )
+            
+            return error_msg
     
-    def _handle_flight_request(self, user_input: str) -> str:
-        """Obsługa zapytań o loty"""
+    def _handle_flight_request(self, user_input: str, full_context: str) -> str:
+        """Obsługa zapytań o loty z kontekstem"""
         try:
-            # Parse parametrów lotu
+            # Parse parametrów lotu z uwzględnieniem historii
             flight_prompt = ChatPromptTemplate.from_template("""
             Wyciągnij parametry lotu z zapytania użytkownika.
+            UWZGLĘDNIJ KONTEKST z poprzednich rozmów - jeśli użytkownik wcześniej mówił o konkretnym miejscu lub dacie, użyj tych informacji.
             
-            ZAPYTANIE: "{query}"
+            HISTORIA ROZMOWY:
+            {full_context}
+            
+            AKTUALNE ZAPYTANIE: "{query}"
             DZISIEJSZA DATA: {today}
             
             KODY IATA: WAW=Warszawa, CDG=Paryż, LHR=Londyn, BER=Berlin, FCO=Rzym, MAD=Madryt, BCN=Barcelona, AMS=Amsterdam, VIE=Wiedeń, PRG=Praga, BUD=Budapeszt, KRK=Kraków, GDN=Gdańsk, WRO=Wrocław
@@ -78,6 +141,8 @@ class TravelAgent:
             - "tanio" → budget=800, sort=CHEAPEST
             - "bezpośredni" → stops="0"
             - Klasa domyślnie: ECONOMY
+            - KONTEKST: Jeśli w historii była mowa o miejscu docelowym, użyj go jako destination
+            - KONTEKST: Jeśli w historii była mowa o datach, użyj ich jako odniesienie
             
             {format_instructions}
             """)
@@ -86,6 +151,7 @@ class TravelAgent:
             query = flight_chain.invoke({
                 "query": user_input,
                 "today": datetime.now().strftime('%Y-%m-%d'),
+                "full_context":   full_context,
                 "format_instructions": self.flight_parser.get_format_instructions()
             })
             
@@ -110,20 +176,24 @@ class TravelAgent:
             print(f"DEBUG: Simplified {len(simplified_flights)} flight offers")
             
             # Formatuj wyniki - przekaż tylko essentials
-            return self._format_results("LOTY", user_input, query, simplified_flights)
+            return self._format_results("LOTY", user_input, query, simplified_flights, full_context)
             
         except Exception as e:
             print(f"Flight error: {e}")
             return f"❌ Błąd wyszukiwania lotów: {str(e)}"
     
-    def _handle_hotel_request(self, user_input: str) -> str:
-        """Obsługa zapytań o hotele"""
+    def _handle_hotel_request(self, user_input: str,  full_context: str) -> str:
+        """Obsługa zapytań o hotele z kontekstem"""
         try:
-            # Parse parametrów hotelu
+            # Parse parametrów hotelu z uwzględnieniem historii
             hotel_prompt = ChatPromptTemplate.from_template("""
             Wyciągnij parametry hotelu z zapytania użytkownika.
+            UWZGLĘDNIJ KONTEKST z poprzednich rozmów - jeśli użytkownik wcześniej mówił o konkretnym miejscu lub datach, użyj tych informacji.
             
-            ZAPYTANIE: "{query}"
+            HISTORIA ROZMOWY:
+            {full_context}
+            
+            AKTUALNE ZAPYTANIE: "{query}"
             DZISIEJSZA DATA: {today}
             
             REGUŁY:
@@ -133,6 +203,8 @@ class TravelAgent:
             - "para" → adults=2
             - "tanio" → price_max=200
             - Domyślnie: 2 noce jeśli nie podano departure_date
+            - KONTEKST: Jeśli w historii była mowa o miejscu, użyj go jako destination
+            - KONTEKST: Jeśli w historii była mowa o datach lotów, dopasuj daty hotelu
             
             {format_instructions}
             """)
@@ -141,6 +213,7 @@ class TravelAgent:
             query = hotel_chain.invoke({
                 "query": user_input,
                 "today": datetime.now().strftime('%Y-%m-%d'),
+                "full_context":   full_context,
                 "format_instructions": self.hotel_parser.get_format_instructions()
             })
             
@@ -169,19 +242,87 @@ class TravelAgent:
             print(f"DEBUG: Simplified {len(simplified_hotels)} hotel offers")
             
             # Formatuj wyniki - przekaż tylko essentials
-            return self._format_results("HOTELE", user_input, query, simplified_hotels)
+            return self._format_results("HOTELE", user_input, query, simplified_hotels, full_context)
             
         except Exception as e:
             print(f"Hotel error: {e}")
             return f"❌ Błąd wyszukiwania hoteli: {str(e)}"
     
-    def _format_results(self, search_type: str, original_query: str, query_params, results) -> str:
-        """Formatowanie wyników przez LLM"""
+    def _handle_attractions_request(self, user_input: str,  full_context: str) -> str:
+        """Obsługa zapytań o atrakcje - wykorzystuje wewnętrzną wiedzę Claude'a"""
+        try:
+            # Wyciągnij kontekst podróży z historii
+          
+            
+            attractions_prompt = ChatPromptTemplate.from_template("""
+            Jesteś ekspertem od turystyki i lokalnych atrakcji. Odpowiedz na zapytanie użytkownika o atrakcje, 
+            wykorzystując swoją rozległą wiedzę o miejscach, kulturze i turystyce.
+            
+            HISTORIA ROZMOWY (context podróży):
+            {full_context}
+            
+           
+            ZAPYTANIE UŻYTKOWNIKA: "{query}"
+            
+            INSTRUKCJE:
+            
+            1. **Wykorzystaj kontekst**: Jeśli wiesz gdzie jedzie użytkownik, skup się na tym miejscu
+            2. **Bądź konkretny**: Podaj nazwy konkretnych miejsc, adresów, godzin otwarcia
+            3. **Uwzględnij praktyczne info**: ceny, transport, czas potrzebny na zwiedzanie
+            4. **Dostosuj do dat**: Jeśli wiesz kiedy jedzie, uwzględnij sezonowość, wydarzenia
+            5. **Kategoryzuj**: Podziel na kategorie (zabytki, muzea, restauracje, rozrywka)
+            6. **Lokalny kontekst**: Dodaj wskazówki lokalnego przewodnika
+            
+            STRUKTURA ODPOWIEDZI:
+            
+            🎯 **[NAZWA MIEJSCA] - Przewodnik po Atrakcjach**
+            
+            **🏛️ MUST-SEE (najważniejsze zabytki)**
+            - [3-5 głównych atrakcji z praktycznymi info]
+            
+            **🍽️ GDZIE JEŚĆ (lokalne specjały)**
+            - [2-3 polecane restauracje/miejsca]
+            
+            **🎨 KULTURA & ROZRYWKA**
+            - [muzea, galerie, wydarzenia]
+            
+            **💡 WSKAZÓWKI PRAKTYCZNE**
+            - Transport lokalny
+            - Najlepsze godziny zwiedzania
+            - Co zabrać / na co uważać
+            - Budżet dzienny
+            
+            **📅 PLAN DNIA** (jeśli możliwe)
+            - Sugerowany harmonogram zwiedzania
+            
+            Pisz po polsku, używaj emoji, bądź entuzjastyczny ale praktyczny. 
+            Jeśli nie ma kontekstu miejsca, zapytaj gdzie jedzie użytkownik.
+            """)
+            
+            attractions_chain = attractions_prompt | self.llm
+            result = attractions_chain.invoke({
+               "query": user_input,
+                "today": datetime.now().strftime('%Y-%m-%d'),
+                "full_context":   full_context
+            })
+            
+            return result.content
+            
+        except Exception as e:
+            print(f"Attractions error: {e}")
+            return f"❌ Błąd przy wyszukiwaniu atrakcji: {str(e)}"
+        
+    def _format_results(self, search_type: str, original_query: str, query_params, results, full_context: str) -> str:
+        """Formatowanie wyników przez LLM z uwzględnieniem kontekstu"""
         format_prompt = ChatPromptTemplate.from_template("""
         Sformatuj wyniki wyszukiwania dla polskiego użytkownika.
+        UWZGLĘDNIJ KONTEKST poprzednich rozmów przy formatowaniu odpowiedzi.
+        
+        HISTORIA ROZMOWY:
+        {full_context}
         
         TYP: {search_type}
-        ZAPYTANIE: "{original_query}"
+        AKTUALNE ZAPYTANIE: "{original_query}"
         PARAMETRY WYSZUKIWANIA: {query_params}
         SUROWE DANE Z API: {results}
         
@@ -189,6 +330,8 @@ class TravelAgent:
         Z CAŁEJ LISTY WYBIERZ TYLKO 5 NAJLEPSZYCH OFERT według kryteriów:
         - Dla LOTÓW: priorytet = 1) bez przesiadek (stops=0), 2) najniższa cena
         - Dla HOTELI: priorytet = najniższa cena (price_per_night)
+        
+        KONTEKST: Jeśli wcześniej w rozmowie były już wyszukiwania, odnieś się do nich (np. "w porównaniu do wcześniejszych opcji", "zgodnie z Twoimi preferencjami").
         
         FORMATOWANIE:
         
@@ -210,6 +353,7 @@ class TravelAgent:
         Na końcu:
         - Krótkie podsumowanie budżetu
         - 2-3 praktyczne wskazówki
+        - Jeśli to ma sens w kontekście rozmowy, zaproponuj następne kroki (np. "czy chcesz teraz poszukać hoteli?" po pokazaniu lotów)
         
         Używaj emoji, polskich znaków, bądź zwięzły ale pomocny.
         """)
@@ -219,10 +363,40 @@ class TravelAgent:
             "search_type": search_type,
             "original_query": original_query,
             "query_params": str(query_params),
-            "results": str(results)
+            "results": str(results),
+            "full_context": full_context
         })
         
         return result.content
+    
+    def _format_chat_history(self, messages) -> str:
+        """Formatuje historię rozmowy do czytelnej formy"""
+        if not messages:
+            return "Brak poprzednich rozmów."
+        
+        history_parts = []
+        for i in range(0, len(messages), 2):
+            if i + 1 < len(messages):
+                user_msg = messages[i].content
+                ai_msg = messages[i + 1].content
+                
+                
+                
+                history_parts.append(f"Użytkownik: {user_msg}")
+                history_parts.append(f"Agent: {ai_msg}")
+        
+      
+        
+        return "\n".join(history_parts)
+    
+    def get_chat_history(self) -> str:
+        """Publiczna metoda do pobierania historii rozmowy"""
+        return self._format_chat_history(self.memory.chat_memory.messages)
+    
+    def clear_memory(self):
+        """Czyści historię rozmowy"""
+        self.memory.clear()
+        print("Historia rozmowy została wyczyszczona.")
     
     def _extract_flight_essentials(self, flights: list) -> list:
         """Wyciąga tylko najważniejsze dane z lotów żeby zmniejszyć tokeny"""
